@@ -44,7 +44,7 @@ USER_AGENTS = [
 DEFAULT_ACCESS_TOKEN_LIFETIME = 3600 * 4  # 4 hours
 DEFAULT_MAX_POLLING_TRIES = 24  # 24 * POLLING_WAIT_TIME = 2 minutes
 DEFAULT_POLLING_WAIT_TIME = 5  # Seconds
-DEFAULT_APK_VERSION = "24.11.0"
+DEFAULT_APK_VERSION = "25.11.0"
 
 APK_RE_SCRIPT = re.compile(r"AF_initDataCallback\({key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+<\/script")
 
@@ -226,7 +226,8 @@ class TgtgClient:
             return self.fixed_user_agent
         version = DEFAULT_APK_VERSION
         try:
-            version = self.get_latest_apk_version()
+            #version = self.get_latest_apk_version()
+            version = DEFAULT_APK_VERSION
         except Exception:
             log.warning("Failed to get latest APK version!")
         log.debug("Using APK version %s.", version)
