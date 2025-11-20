@@ -44,7 +44,7 @@ USER_AGENTS = [
 DEFAULT_ACCESS_TOKEN_LIFETIME = 3600 * 4  # 4 hours
 DEFAULT_MAX_POLLING_TRIES = 24  # 24 * POLLING_WAIT_TIME = 2 minutes
 DEFAULT_POLLING_WAIT_TIME = 5  # Seconds
-DEFAULT_APK_VERSION = "25.11.0"
+DEFAULT_APK_VERSION = "25.10.0"
 
 APK_RE_SCRIPT = re.compile(r"AF_initDataCallback\({key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+<\/script")
 
