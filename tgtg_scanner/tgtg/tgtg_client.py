@@ -247,7 +247,7 @@ class TgtgClient:
                 log.warning(request_url)
                 log.warning(self.access_token)
                 
-                response = self.session.post(request_url, access_token=self.access_token, **kwargs)
+                response = self.session.post(request_url, access_token=self.datadome_cookie, **kwargs)
 
                 if response.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED):
                     self.captcha_error_count = 0
