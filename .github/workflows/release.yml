@@ -16,14 +16,8 @@ jobs:
       fail-fast: ${{ github.event_name == 'push' }}
       matrix:
         include:
-          - os: ubuntu-latest
-            tag: linux
           - os: windows-latest
             tag: win
-          - os: macos-15
-            tag: macos-arm64
-          - os: macos-15-intel
-            tag: macos-intel
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-poetry-action
