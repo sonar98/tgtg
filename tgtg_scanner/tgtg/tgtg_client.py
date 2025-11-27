@@ -242,6 +242,7 @@ class TgtgClient:
                 # Now that the jar is clean of old datadome cookies, set the new one.
                 self.session.cookies.set("datadome", new_cookie)
 
+                log.warning(self.datadome_cookie)
                 log.info("Retrying request with new Datadome cookie.")
                 response = self.session.post(request_url, access_token=self.access_token, **kwargs)
 
