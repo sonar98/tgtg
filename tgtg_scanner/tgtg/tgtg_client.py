@@ -245,7 +245,7 @@ class TgtgClient:
                 log.warning(self.datadome_cookie)
                 log.info("Retrying request with new Datadome cookie.")
                 log.warning(request_url)
-                log.warning(access_token)
+                log.warning(self.access_token)
                 
                 response = self.session.post(request_url, access_token=self.access_token, **kwargs)
 
