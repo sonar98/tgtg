@@ -255,6 +255,7 @@ class TgtgClient:
 
             except Exception as e:
                 log.error(f"Failed to refresh Datadome cookie: {e}. Falling back to failsafe logic.")
+                log.warning(response.status_code)
 
             log.debug("Datadome refresh did not solve the 403. Applying failsafe captcha logic.")
             self.captcha_error_count += 1
@@ -268,6 +269,8 @@ class TgtgClient:
             return self._post(path, **kwargs)
 
         raise TgtgAPIError(response.status_code, response.content)
+        log.warning(response.content)
+    
 
     def _get_user_agent(self) -> str:
         if self.fixed_user_agent: return self.fixed_user_agent
