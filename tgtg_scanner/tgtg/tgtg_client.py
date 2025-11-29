@@ -1,4 +1,4 @@
-# Copied and modified from https://github.com/ahivert/tgtg-python
+# Full patched tgtg_client.py with Datadome cookie support
 
 import json
 import logging
@@ -6,6 +6,7 @@ import random
 import re
 import time
 import uuid
+import secrets
 from datetime import datetime
 from http import HTTPStatus
 from urllib.parse import urljoin, urlsplit
@@ -46,55 +47,12 @@ DEFAULT_MAX_POLLING_TRIES = 24  # 24 * POLLING_WAIT_TIME = 2 minutes
 DEFAULT_POLLING_WAIT_TIME = 5  # Seconds
 DEFAULT_APK_VERSION = "24.11.0"
 
-APK_RE_SCRIPT = re.compile(r"AF_initDataCallback\({key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+<\/script")
+APK_RE_SCRIPT = re.compile(r"AF_initDataCallback\({key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+<\\/script")
 
-
-# -------------------------
-# Minimal DataDome manager
-# -------------------------
-class DataDomeManager:
-    """
-    Small helper to fetch a fresh `datadome` cookie.
-    It uses a short-lived requests.Session and triggers a request
-    that typically causes DataDome to set a cookie (authByEmail).
-    """
-
-    def __init__(self, base_url: str = BASE_URL, timeout: int | None = 30, proxies: dict | None = None):
-        self.base_url = base_url
-        self.timeout = timeout or 30
-        self.proxies = proxies
-
-    def _get_url(self, path: str) -> str:
-        return urljoin(self.base_url, path)
-
-    def fetch_datadome_cookie(self) -> str | None:
-        s = requests.Session()
-        # Minimal headers that mimic the app just enough to get datadome set
-        s.headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept-Encoding": "gzip",
-                "Accept-Language": "en-GB",
-                "User-Agent": random.choice(USER_AGENTS).format(DEFAULT_APK_VERSION),
-            }
-        )
-        if self.proxies:
-            s.proxies.update(self.proxies)
-
-        fake_email = f"datadome-{uuid.uuid4()}@example.com"
-        try:
-            # A POST to authByEmail often triggers the DataDome cookie to be set
-            s.post(
-                self._get_url(AUTH_BY_EMAIL_ENDPOINT),
-                json={"device_type": "ANDROID", "email": fake_email},
-                timeout=self.timeout,
-            )
-        except Exception:
-            # We don't require the request to succeed; DataDome may set cookie even on error/403
-            pass
-
-        return s.cookies.get("datadome")
+# Datadome constants
+DATADOME_ENDPOINT = "https://api-sdk.datadome.co/sdk/"
+DATADOME_KEY = "1D42C2CA6131C526E09F294FE96F94"
+DATADOME_SDK_VERSION = "3.0.4"
 
 
 class TgtgSession(requests.Session):
@@ -199,12 +157,63 @@ class TgtgClient:
 
         self.captcha_error_count = 0
 
-        # minimal DataDome manager instance used to fetch cookies when needed
-        self._datadome_manager = DataDomeManager(self.base_url, timeout=self.timeout or 30, proxies=self.proxies)
-
     def __del__(self) -> None:
         if self.session:
             self.session.close()
+
+    def _fetch_datadome_cookie(self, request_url: str) -> str:
+        """Fetch a new Datadome cookie by emulating the Android SDK POST to the SDK endpoint.
+
+        Returns the raw datadome cookie value (without the `datadome=` prefix).
+        """
+        cid = secrets.token_hex(32)
+        d_ifv = secrets.token_hex(16)
+
+        events = [{"id": 1, "message": "response validation", "source": "sdk", "date": int(time.time() * 1000)}]
+
+        payload = {
+            "cid": cid,
+            "ddk": DATADOME_KEY,
+            "request": request_url,
+            "ua": self.user_agent or f"TGTG/{DEFAULT_APK_VERSION} Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7 Pro Build/UQ1A.240105.004)",
+            "events": json.dumps(events),
+            "inte": "android-java-okhttp",
+            "ddv": DATADOME_SDK_VERSION,
+            "ddvc": self.apk_version or DEFAULT_APK_VERSION,
+            "os": "Android",
+            "osr": "14",
+            "osn": "UPSIDE_DOWN_CAKE",
+            "osv": "34",
+            "screen_x": "1440",
+            "screen_y": "3120",
+            "screen_d": "3.5",
+            "camera": json.dumps({"auth": "true", "info": json.dumps({"front": "2000x1500", "back": "5472x3648"})}),
+            "mdl": "Pixel 7 Pro",
+            "prd": "Pixel 7 Pro",
+            "mnf": "Google",
+            "dev": "cheetah",
+            "hrd": "GS201",
+            "fgp": "google/cheetah/cheetah:14/UQ1A.240105.004/10814564:user/release-keys",
+            "tgs": "release-keys",
+            "d_ifv": d_ifv,
+        }
+
+        headers = {"User-Agent": "okhttp/5.1.0", "Content-Type": "application/x-www-form-urlencoded"}
+
+        resp = requests.post(DATADOME_ENDPOINT, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") != 0:
+            raise TgtgAPIError(f"Datadome SDK returned non-zero status: {data}")
+
+        cookie_header = data.get("cookie")
+        if not cookie_header:
+            raise TgtgAPIError(f"Datadome response missing cookie: {data}")
+
+        # cookie_header looks like: "datadome=...; Path=/; Secure; HttpOnly"
+        cookie_value = cookie_header.split("datadome=", 1)[1].split(";", 1)[0]
+        return cookie_value
 
     def _get_url(self, path) -> str:
         return urljoin(self.base_url, path)
@@ -212,17 +221,6 @@ class TgtgClient:
     def _create_session(self) -> TgtgSession:
         if not self.user_agent:
             self.user_agent = self._get_user_agent()
-
-        # If we don't have a datadome cookie yet, try to fetch one (best-effort)
-        if not self.datadome_cookie:
-            try:
-                new_cookie = self._datadome_manager.fetch_datadome_cookie()
-                if new_cookie:
-                    log.debug("Fetched DataDome cookie during session creation.")
-                    self.datadome_cookie = new_cookie
-            except Exception:
-                log.debug("Failed to fetch DataDome cookie during session creation (continuing without it).", exc_info=True)
-
         return TgtgSession(
             self.user_agent,
             self.language,
@@ -233,12 +231,7 @@ class TgtgClient:
         )
 
     def get_credentials(self) -> dict:
-        """Returns current tgtg api credentials.
-
-        Returns:
-            dict: Dictionary containing access token, refresh token and user id
-
-        """
+        """Returns current tgtg api credentials."""
         self.login()
         return {
             "email": self.email,
@@ -250,48 +243,56 @@ class TgtgClient:
     def _post(self, path, **kwargs) -> requests.Response:
         if not self.session:
             self.session = self._create_session()
-        response = self.session.post(
-            self._get_url(path),
-            access_token=self.access_token,
-            **kwargs,
-        )
-        # keep track of datadome cookie from the active session
-        self.datadome_cookie = self.session.cookies.get("datadome")
+
+        response = self.session.post(self._get_url(path), access_token=self.access_token, **kwargs)
+
+        # Update datadome cookie from session if present
+        self.datadome_cookie = self.session.cookies.get("datadome") or self.datadome_cookie
+
         if response.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED):
             self.captcha_error_count = 0
             return response
-        # Status Code == 403
-        # --> Blocked due to rate limit / wrong user_agent.
-        # 1. Try: Get latest APK Version from google
-        # 2. Try: Reset session
-        # 3. Try: Delete datadome cookie and reset session
-        # 10.Try: Sleep 10 minutes, and reset session
+
+        # Handle 403 by attempting Datadome cookie refresh (minimal strategy)
         if response.status_code == 403:
-            log.debug("Captcha Error 403!")
+            log.debug("Captcha Error 403 for path %s", path)
             self.captcha_error_count += 1
+
+            # Try a few lightweight mitigations first
             if self.captcha_error_count == 1:
+                # rotate user-agent
                 self.user_agent = self._get_user_agent()
-            elif self.captcha_error_count == 2:
                 self.session = self._create_session()
-            elif self.captcha_error_count == 4:
-                # On repeated captcha errors, explicitly attempt to refresh datadome cookie
+            elif self.captcha_error_count == 2:
+                # reset session
+                self.session = self._create_session()
+            else:
+                # attempt to fetch a fresh datadome cookie and retry once
                 try:
-                    log.info("Attempting to refresh DataDome cookie after repeated 403s.")
-                    self.refresh_datadome_cookie()
-                except Exception:
-                    # If fetch fails, clear cookie and create a fresh session anyway
-                    log.warning("Refreshing DataDome cookie failed; clearing cookie and recreating session.", exc_info=True)
-                    self.datadome_cookie = None
-                finally:
+                    new_cookie = self._fetch_datadome_cookie(self._get_url(path))
+                    self.datadome_cookie = new_cookie
+                    # create a fresh session carrying the new cookie
                     self.session = self._create_session()
-            elif self.captcha_error_count >= 10:
+                    log.info("Datadome cookie refreshed successfully")
+                    # retry original request once
+                    response = self.session.post(self._get_url(path), access_token=self.access_token, **kwargs)
+                    self.datadome_cookie = self.session.cookies.get("datadome") or self.datadome_cookie
+                    if response.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED):
+                        self.captcha_error_count = 0
+                        return response
+                except Exception as e:
+                    log.error("Failed to refresh Datadome cookie: %s", e)
+
+            # Backoff and retry recursively up to internal logic
+            if self.captcha_error_count >= 10:
                 log.warning("Too many captcha Errors! Sleeping for 10 minutes...")
                 time.sleep(10 * 60)
-                log.info("Retrying ...")
                 self.captcha_error_count = 0
                 self.session = self._create_session()
+
             time.sleep(1)
             return self._post(path, **kwargs)
+
         raise TgtgAPIError(response.status_code, response.content)
 
     def _get_user_agent(self) -> str:
@@ -310,12 +311,7 @@ class TgtgClient:
 
     @staticmethod
     def get_latest_apk_version() -> str:
-        """Returns latest APK version of the official Android TGTG App.
-
-        Returns:
-            str: APK Version string
-
-        """
+        """Returns latest APK version of the official Android TGTG App."""
         response = requests.get(
             "https://play.google.com/store/apps/details?id=com.app.tgtg&hl=en&gl=US",
             timeout=30,
@@ -439,12 +435,6 @@ class TgtgClient:
         return response.json()
 
     def get_favorites(self) -> list[dict]:
-        """Returns favorites of the current tgtg account.
-
-        Returns:
-            List: List of items
-
-        """
         items = []
         page = 1
         page_size = 100
@@ -504,22 +494,3 @@ class TgtgClient:
             },
         )
         return response.json()
-
-    # ------------------------------------------------------------------
-    # Public helper to refresh DataDome cookie (exposed for manual calls)
-    # ------------------------------------------------------------------
-    def refresh_datadome_cookie(self) -> str:
-        """
-        Force-fetch a fresh datadome cookie using the DataDomeManager and
-        return the new cookie. Raises TgtgAPIError on failure.
-        """
-        log.info("Refreshing DataDome cookie (manual request)...")
-        new_cookie = self._datadome_manager.fetch_datadome_cookie()
-        if not new_cookie:
-            raise TgtgAPIError("Failed to obtain new DataDome cookie")
-        self.datadome_cookie = new_cookie
-        # If a session already exists, recreate it to apply the cookie
-        if self.session:
-            self.session = self._create_session()
-        log.debug("DataDome cookie refreshed successfully.")
-        return new_cookie
