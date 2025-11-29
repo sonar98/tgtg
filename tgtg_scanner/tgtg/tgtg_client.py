@@ -9,31 +9,20 @@ import uuid
 from datetime import datetime
 from http import HTTPStatus
 from urllib.parse import urljoin, urlsplit
-import secrets
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# Assuming tgtg_scanner.errors exists in the execution environment.
-# If not, define placeholder exception classes.
-try:
-    from tgtg_scanner.errors import (
-        TgtgAPIError,
-        TGTGConfigurationError,
-        TgtgLoginError,
-        TgtgPollingError,
-    )
-except ImportError:
-    class TgtgAPIError(Exception): pass
-    class TGTGConfigurationError(Exception): pass
-    class TgtgLoginError(Exception): pass
-    class TgtgPollingError(Exception): pass
-
+from tgtg_scanner.errors import (
+    TgtgAPIError,
+    TGTGConfigurationError,
+    TgtgLoginError,
+    TgtgPollingError,
+)
 
 log = logging.getLogger("tgtg")
 BASE_URL = "https://apptoogoodtogo.com/api/"
-DATADOME_SDK_URL = "https://api-sdk.datadome.co/sdk/"
 API_ITEM_ENDPOINT = "item/v9/"
 FAVORITE_ITEM_ENDPOINT = "user/favorite/v1/{}/update"
 AUTH_BY_EMAIL_ENDPOINT = "auth/v5/authByEmail"
@@ -60,6 +49,54 @@ DEFAULT_APK_VERSION = "24.11.0"
 APK_RE_SCRIPT = re.compile(r"AF_initDataCallback\({key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+<\/script")
 
 
+# -------------------------
+# Minimal DataDome manager
+# -------------------------
+class DataDomeManager:
+    """
+    Small helper to fetch a fresh `datadome` cookie.
+    It uses a short-lived requests.Session and triggers a request
+    that typically causes DataDome to set a cookie (authByEmail).
+    """
+
+    def __init__(self, base_url: str = BASE_URL, timeout: int | None = 30, proxies: dict | None = None):
+        self.base_url = base_url
+        self.timeout = timeout or 30
+        self.proxies = proxies
+
+    def _get_url(self, path: str) -> str:
+        return urljoin(self.base_url, path)
+
+    def fetch_datadome_cookie(self) -> str | None:
+        s = requests.Session()
+        # Minimal headers that mimic the app just enough to get datadome set
+        s.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept-Encoding": "gzip",
+                "Accept-Language": "en-GB",
+                "User-Agent": random.choice(USER_AGENTS).format(DEFAULT_APK_VERSION),
+            }
+        )
+        if self.proxies:
+            s.proxies.update(self.proxies)
+
+        fake_email = f"datadome-{uuid.uuid4()}@example.com"
+        try:
+            # A POST to authByEmail often triggers the DataDome cookie to be set
+            s.post(
+                self._get_url(AUTH_BY_EMAIL_ENDPOINT),
+                json={"device_type": "ANDROID", "email": fake_email},
+                timeout=self.timeout,
+            )
+        except Exception:
+            # We don't require the request to succeed; DataDome may set cookie even on error/403
+            pass
+
+        return s.cookies.get("datadome")
+
+
 class TgtgSession(requests.Session):
     http_adapter = HTTPAdapter(
         max_retries=Retry(
@@ -79,6 +116,7 @@ class TgtgSession(requests.Session):
         timeout: int | None = None,
         proxies: dict | None = None,
         datadome_cookie: str | None = None,
+        base_url: str = BASE_URL,
         *args,
         **kwargs,
     ) -> None:
@@ -98,7 +136,9 @@ class TgtgSession(requests.Session):
         if proxies:
             self.proxies = proxies
         if datadome_cookie:
-            self.cookies.set("datadome", datadome_cookie)
+            domain = urlsplit(base_url).hostname
+            domain = f".{'local' if domain == 'localhost' else domain}"
+            self.cookies.set("datadome", datadome_cookie, domain=domain, path="/", secure=True)
 
     def post(self, *args, access_token: str | None = None, **kwargs) -> requests.Response:
         if "headers" not in kwargs:
@@ -159,6 +199,9 @@ class TgtgClient:
 
         self.captcha_error_count = 0
 
+        # minimal DataDome manager instance used to fetch cookies when needed
+        self._datadome_manager = DataDomeManager(self.base_url, timeout=self.timeout or 30, proxies=self.proxies)
+
     def __del__(self) -> None:
         if self.session:
             self.session.close()
@@ -169,15 +212,33 @@ class TgtgClient:
     def _create_session(self) -> TgtgSession:
         if not self.user_agent:
             self.user_agent = self._get_user_agent()
+
+        # If we don't have a datadome cookie yet, try to fetch one (best-effort)
+        if not self.datadome_cookie:
+            try:
+                new_cookie = self._datadome_manager.fetch_datadome_cookie()
+                if new_cookie:
+                    log.debug("Fetched DataDome cookie during session creation.")
+                    self.datadome_cookie = new_cookie
+            except Exception:
+                log.debug("Failed to fetch DataDome cookie during session creation (continuing without it).", exc_info=True)
+
         return TgtgSession(
             self.user_agent,
             self.language,
             self.timeout,
             self.proxies,
             self.datadome_cookie,
+            self.base_url,
         )
 
     def get_credentials(self) -> dict:
+        """Returns current tgtg api credentials.
+
+        Returns:
+            dict: Dictionary containing access token, refresh token and user id
+
+        """
         self.login()
         return {
             "email": self.email,
@@ -185,111 +246,83 @@ class TgtgClient:
             "refresh_token": self.refresh_token,
             "datadome_cookie": self.datadome_cookie,
         }
-        
-    def _get_datadome_cookie(self, request_url: str) -> str:
-        log.info("Fetching new Datadome cookie...")
-        apk_version = self.apk_version or DEFAULT_APK_VERSION
-        payload = {
-            "cid": secrets.token_hex(32),
-            "ddk": "1D42C2CA6131C526E09F294FE96F94", "request": request_url,
-            "ua": self.user_agent, "events": json.dumps([{"id": 1, "message": "response validation", "source": "sdk", "date": int(time.time() * 1000)}]),
-            "inte": "android-java-okhttp", "ddv": "3.0.4", "ddvc": apk_version,
-            "os": "Android", "osr": "14", "osn": "UPSIDE_DOWN_CAKE", "osv": "34",
-            "screen_x": 1440, "screen_y": 3120, "screen_d": 3.5,
-            "camera": '{"auth":"true", "info":"{\\"front\\":\\"2000x1500\\",\\"back\\":\\"5472x3648\\"}"}',
-            "mdl": "Pixel 7 Pro", "prd": "Pixel 7 Pro", "mnf": "Google", "dev": "cheetah",
-            "hrd": "GS201", "fgp": "google/cheetah/cheetah:14/UQ1A.240105.004/10814564:user/release-keys",
-            "tgs": "release-keys", "d_ifv": secrets.token_hex(16),
-        }
-        headers = {"User-Agent": "okhttp/5.1.0", "Content-Type": "application/x-www-form-urlencoded"}
-        response = requests.post(DATADOME_SDK_URL, data=payload, headers=headers, timeout=self.timeout, proxies=self.proxies)
-        response.raise_for_status()
-        return response.json()["cookie"]
 
     def _post(self, path, **kwargs) -> requests.Response:
         if not self.session:
             self.session = self._create_session()
-
-        request_url = self._get_url(path)
-        response = self.session.post(request_url, access_token=self.access_token, **kwargs)
-
+        response = self.session.post(
+            self._get_url(path),
+            access_token=self.access_token,
+            **kwargs,
+        )
+        # keep track of datadome cookie from the active session
+        self.datadome_cookie = self.session.cookies.get("datadome")
         if response.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED):
             self.captcha_error_count = 0
-            # Don't use .get() here to avoid the conflict error. The session manages the cookie.
-            # We only need to interact manually when there's a 403 error.
             return response
-
+        # Status Code == 403
+        # --> Blocked due to rate limit / wrong user_agent.
+        # 1. Try: Get latest APK Version from google
+        # 2. Try: Reset session
+        # 3. Try: Delete datadome cookie and reset session
+        # 10.Try: Sleep 10 minutes, and reset session
         if response.status_code == 403:
-            log.warning("Received 403. Attempting to fetch a new Datadome cookie.")
-            try:
-                new_cookie = self._get_datadome_cookie(request_url)
-                self.datadome_cookie = new_cookie
-
-                # --- CORRECTED COOKIE CLEARING LOGIC ---
-                # Create a copy of the list to iterate over, as we will be modifying the cookie jar
-                cookies_to_remove = [c for c in list(self.session.cookies) if c.name == 'datadome']
-                for cookie in cookies_to_remove:
-                    # To remove a cookie from a RequestsCookieJar, you can't use 'del' if there are duplicates.
-                    # The most reliable way is to set its value to None and expire it.
-                    self.session.cookies.set(
-                        name=cookie.name,
-                        value=None,
-                        domain=cookie.domain,
-                        path=cookie.path,
-                        expires=0 # A time in the past
-                    )
-                
-                # Now that the jar is clean of old datadome cookies, set the new one.
-                self.session.cookies.set("datadome", new_cookie)
-
-                log.warning(self.datadome_cookie)
-                log.info("Retrying request with new Datadome cookie.")
-                log.warning(request_url)
-                log.warning(self.access_token)
-                
-                response = self.session.post(request_url, access_token=self.datadome_cookie, **kwargs)
-
-                if response.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED):
-                    self.captcha_error_count = 0
-                    return response
-                
-                if response.status_code != 403:
-                    raise TgtgAPIError(response.status_code, response.content)
-
-            except Exception as e:
-                log.error(f"Failed to refresh Datadome cookie: {e}. Falling back to failsafe logic.")
-                log.warning(response.status_code)
-
-            log.debug("Datadome refresh did not solve the 403. Applying failsafe captcha logic.")
+            log.debug("Captcha Error 403!")
             self.captcha_error_count += 1
-            if self.captcha_error_count == 1: self.user_agent = self._get_user_agent()
-            elif self.captcha_error_count == 2: self.session = self._create_session()
-            elif self.captcha_error_count == 4: self.datadome_cookie = None; self.session = self._create_session()
+            if self.captcha_error_count == 1:
+                self.user_agent = self._get_user_agent()
+            elif self.captcha_error_count == 2:
+                self.session = self._create_session()
+            elif self.captcha_error_count == 4:
+                # On repeated captcha errors, explicitly attempt to refresh datadome cookie
+                try:
+                    log.info("Attempting to refresh DataDome cookie after repeated 403s.")
+                    self.refresh_datadome_cookie()
+                except Exception:
+                    # If fetch fails, clear cookie and create a fresh session anyway
+                    log.warning("Refreshing DataDome cookie failed; clearing cookie and recreating session.", exc_info=True)
+                    self.datadome_cookie = None
+                finally:
+                    self.session = self._create_session()
             elif self.captcha_error_count >= 10:
-                log.warning("Too many captcha Errors! Sleeping for 10 minutes..."); time.sleep(10 * 60)
-                log.info("Retrying ..."); self.captcha_error_count = 0; self.session = self._create_session()
+                log.warning("Too many captcha Errors! Sleeping for 10 minutes...")
+                time.sleep(10 * 60)
+                log.info("Retrying ...")
+                self.captcha_error_count = 0
+                self.session = self._create_session()
             time.sleep(1)
             return self._post(path, **kwargs)
-
         raise TgtgAPIError(response.status_code, response.content)
-        log.warning(response.content)
-    
 
     def _get_user_agent(self) -> str:
-        if self.fixed_user_agent: return self.fixed_user_agent
+        if self.fixed_user_agent:
+            return self.fixed_user_agent
         version = DEFAULT_APK_VERSION
         if self.apk_version is None:
-            try: version = self.get_latest_apk_version()
-            except Exception: log.warning("Failed to get latest APK version!")
-        else: version = self.apk_version
+            try:
+                version = self.get_latest_apk_version()
+            except Exception:
+                log.warning("Failed to get latest APK version!")
+        else:
+            version = self.apk_version
         log.debug("Using APK version %s.", version)
         return random.choice(USER_AGENTS).format(version)
 
     @staticmethod
     def get_latest_apk_version() -> str:
-        response = requests.get("https://play.google.com/store/apps/details?id=com.app.tgtg&hl=en&gl=US", timeout=30)
+        """Returns latest APK version of the official Android TGTG App.
+
+        Returns:
+            str: APK Version string
+
+        """
+        response = requests.get(
+            "https://play.google.com/store/apps/details?id=com.app.tgtg&hl=en&gl=US",
+            timeout=30,
+        )
         match = APK_RE_SCRIPT.search(response.text)
-        if not match: raise TgtgAPIError("Failed to get latest APK version from Google Play Store.")
+        if not match:
+            raise TgtgAPIError("Failed to get latest APK version from Google Play Store.")
         data = json.loads(match.group(1))
         return data[1][2][140][0][0][0]
 
@@ -298,64 +331,143 @@ class TgtgClient:
         return bool(self.access_token and self.refresh_token)
 
     def _refresh_token(self) -> None:
-        if (self.last_time_token_refreshed and (datetime.now() - self.last_time_token_refreshed).seconds <= self.access_token_lifetime): return
+        if (
+            self.last_time_token_refreshed
+            and (datetime.now() - self.last_time_token_refreshed).seconds <= self.access_token_lifetime
+        ):
+            return
         response = self._post(REFRESH_ENDPOINT, json={"refresh_token": self.refresh_token})
         self.access_token = response.json().get("access_token")
         self.refresh_token = response.json().get("refresh_token")
         self.last_time_token_refreshed = datetime.now()
 
     def login(self) -> None:
-        if not (self.email or self.access_token and self.refresh_token): raise TGTGConfigurationError("You must provide at least email or access_token and refresh_token")
-        if self._already_logged: self._refresh_token()
+        if not (self.email or self.access_token and self.refresh_token):
+            raise TGTGConfigurationError("You must provide at least email or access_token and refresh_token")
+        if self._already_logged:
+            self._refresh_token()
         else:
             log.info("Starting login process ...")
-            response = self._post(AUTH_BY_EMAIL_ENDPOINT, json={"device_type": self.device_type, "email": self.email})
+            response = self._post(
+                AUTH_BY_EMAIL_ENDPOINT,
+                json={
+                    "device_type": self.device_type,
+                    "email": self.email,
+                },
+            )
             first_login_response = response.json()
-            if first_login_response["state"] == "TERMS": raise TgtgPollingError(f"This email {self.email} is not linked to a tgtg account. Please signup with this email first.")
-            if first_login_response.get("state") == "WAIT": self.start_polling(first_login_response.get("polling_id"))
-            else: raise TgtgLoginError(response.status_code, response.content)
+            if first_login_response["state"] == "TERMS":
+                raise TgtgPollingError(
+                    f"This email {self.email} is not linked to a tgtg account. Please signup with this email first."
+                )
+            if first_login_response.get("state") == "WAIT":
+                self.start_polling(first_login_response.get("polling_id"))
+            else:
+                raise TgtgLoginError(response.status_code, response.content)
 
     def start_polling(self, polling_id) -> None:
         for _ in range(self.max_polling_tries):
-            response = self._post(AUTH_POLLING_ENDPOINT, json={"device_type": self.device_type, "email": self.email, "request_polling_id": polling_id})
+            response = self._post(
+                AUTH_POLLING_ENDPOINT,
+                json={
+                    "device_type": self.device_type,
+                    "email": self.email,
+                    "request_polling_id": polling_id,
+                },
+            )
             if response.status_code == HTTPStatus.ACCEPTED:
-                log.warning("Check your mailbox on PC to continue... (Mailbox on mobile won't work, if you have installed tgtg app.)")
-                time.sleep(self.polling_wait_time); continue
+                log.warning(
+                    "Check your mailbox on PC to continue... (Mailbox on mobile won't work, if you have installed tgtg app.)"
+                )
+                time.sleep(self.polling_wait_time)
+                continue
             if response.status_code == HTTPStatus.OK:
                 log.info("Logged in!")
                 login_response = response.json()
-                self.access_token = login_response.get("access_token"); self.refresh_token = login_response.get("refresh_token")
-                self.last_time_token_refreshed = datetime.now(); return
+                self.access_token = login_response.get("access_token")
+                self.refresh_token = login_response.get("refresh_token")
+                self.last_time_token_refreshed = datetime.now()
+                return
         raise TgtgPollingError("Max polling retries reached. Try again.")
 
-    def get_items(self, *, latitude=0.0, longitude=0.0, radius=21, page_size=20, page=1, discover=False, favorites_only=True, item_categories=None, diet_categories=None, pickup_earliest=None, pickup_latest=None, search_phrase=None, with_stock_only=False, hidden_only=False, we_care_only=False) -> list[dict]:
+    def get_items(
+        self,
+        *,
+        latitude=0.0,
+        longitude=0.0,
+        radius=21,
+        page_size=20,
+        page=1,
+        discover=False,
+        favorites_only=True,
+        item_categories=None,
+        diet_categories=None,
+        pickup_earliest=None,
+        pickup_latest=None,
+        search_phrase=None,
+        with_stock_only=False,
+        hidden_only=False,
+        we_care_only=False,
+    ) -> list[dict]:
         self.login()
-        data = { "origin": {"latitude": latitude, "longitude": longitude}, "radius": radius, "page_size": page_size, "page": page, "discover": discover, "favorites_only": favorites_only, "item_categories": item_categories if item_categories else [], "diet_categories": diet_categories if diet_categories else [], "pickup_earliest": pickup_earliest, "pickup_latest": pickup_latest, "search_phrase": search_phrase if search_phrase else None, "with_stock_only": with_stock_only, "hidden_only": hidden_only, "we_care_only": we_care_only }
+        # fields are sorted like in the app
+        data = {
+            "origin": {"latitude": latitude, "longitude": longitude},
+            "radius": radius,
+            "page_size": page_size,
+            "page": page,
+            "discover": discover,
+            "favorites_only": favorites_only,
+            "item_categories": item_categories if item_categories else [],
+            "diet_categories": diet_categories if diet_categories else [],
+            "pickup_earliest": pickup_earliest,
+            "pickup_latest": pickup_latest,
+            "search_phrase": search_phrase if search_phrase else None,
+            "with_stock_only": with_stock_only,
+            "hidden_only": hidden_only,
+            "we_care_only": we_care_only,
+        }
         response = self._post(API_ITEM_ENDPOINT, json=data)
         return response.json().get("items", [])
 
     def get_item(self, item_id: str) -> dict:
         self.login()
-        response = self._post(f"{API_ITEM_ENDPOINT}/{item_id}", json={"origin": None})
+        response = self._post(
+            f"{API_ITEM_ENDPOINT}/{item_id}",
+            json={"origin": None},
+        )
         return response.json()
 
     def get_favorites(self) -> list[dict]:
-        items = []; page = 1; page_size = 100
+        """Returns favorites of the current tgtg account.
+
+        Returns:
+            List: List of items
+
+        """
+        items = []
+        page = 1
+        page_size = 100
         while True:
             new_items = self.get_items(favorites_only=True, page_size=page_size, page=page)
             items += new_items
-            if len(new_items) < page_size: break
+            if len(new_items) < page_size:
+                break
             page += 1
         return items
 
     def set_favorite(self, item_id: str, is_favorite: bool) -> None:
         self.login()
-        self._post(FAVORITE_ITEM_ENDPOINT.format(item_id), json={"is_favorite": is_favorite})
+        self._post(
+            FAVORITE_ITEM_ENDPOINT.format(item_id),
+            json={"is_favorite": is_favorite},
+        )
 
     def create_order(self, item_id: str, item_count: int) -> dict[str, str]:
         self.login()
         response = self._post(f"{CREATE_ORDER_ENDPOINT}/{item_id}", json={"item_count": item_count})
-        if response.json().get("state") != "SUCCESS": raise TgtgAPIError(response.status_code, response.content)
+        if response.json().get("state") != "SUCCESS":
+            raise TgtgAPIError(response.status_code, response.content)
         return response.json().get("order", {})
 
     def get_order_status(self, order_id: str) -> dict[str, str]:
@@ -364,11 +476,50 @@ class TgtgClient:
         return response.json()
 
     def abort_order(self, order_id: str) -> None:
+        """Use this when your order is not yet paid."""
         self.login()
         response = self._post(ABORT_ORDER_ENDPOINT.format(order_id), json={"cancel_reason_id": 1})
-        if response.json().get("state") != "SUCCESS": raise TgtgAPIError(response.status_code, response.content)
+        if response.json().get("state") != "SUCCESS":
+            raise TgtgAPIError(response.status_code, response.content)
 
     def get_manufactureritems(self) -> dict:
         self.login()
-        response = self._post(MANUFACTURERITEM_ENDPOINT, json={"action_types_accepted": ["QUERY"], "display_types_accepted": ["LIST", "FILL"], "element_types_accepted": ["ITEM", "HIGHLIGHTED_ITEM", "MANUFACTURER_STORY_CARD", "DUO_ITEMS", "DUO_ITEMS_V2", "TEXT", "PARCEL_TEXT", "NPS", "SMALL_CARDS_CAROUSEL", "ITEM_CARDS_CAROUSEL"]})
+        response = self._post(
+            MANUFACTURERITEM_ENDPOINT,
+            json={
+                "action_types_accepted": ["QUERY"],
+                "display_types_accepted": ["LIST", "FILL"],
+                "element_types_accepted": [
+                    "ITEM",
+                    "HIGHLIGHTED_ITEM",
+                    "MANUFACTURER_STORY_CARD",
+                    "DUO_ITEMS",
+                    "DUO_ITEMS_V2",
+                    "TEXT",
+                    "PARCEL_TEXT",
+                    "NPS",
+                    "SMALL_CARDS_CAROUSEL",
+                    "ITEM_CARDS_CAROUSEL",
+                ],
+            },
+        )
         return response.json()
+
+    # ------------------------------------------------------------------
+    # Public helper to refresh DataDome cookie (exposed for manual calls)
+    # ------------------------------------------------------------------
+    def refresh_datadome_cookie(self) -> str:
+        """
+        Force-fetch a fresh datadome cookie using the DataDomeManager and
+        return the new cookie. Raises TgtgAPIError on failure.
+        """
+        log.info("Refreshing DataDome cookie (manual request)...")
+        new_cookie = self._datadome_manager.fetch_datadome_cookie()
+        if not new_cookie:
+            raise TgtgAPIError("Failed to obtain new DataDome cookie")
+        self.datadome_cookie = new_cookie
+        # If a session already exists, recreate it to apply the cookie
+        if self.session:
+            self.session = self._create_session()
+        log.debug("DataDome cookie refreshed successfully.")
+        return new_cookie
